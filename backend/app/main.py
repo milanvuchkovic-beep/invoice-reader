@@ -4,6 +4,7 @@ from fastapi.responses import JSONResponse
 import requests
 import os
 import re
+import base64
 
 app = FastAPI(title="Invoice Reader API")
 
@@ -16,7 +17,7 @@ app.add_middleware(
 
 # DeepSeek API konfiguracija
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-DEEPSEEK_OCR_URL = "https://api.deepseek.com/ocr"
+DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 
 @app.get("/")
 async def root():
@@ -31,12 +32,11 @@ async def upload_invoice(file: UploadFile = File(...)):
         # Pročitaj fajl
         contents = await file.read()
         
-        # Pozovi DeepSeek OCR API
-        ocr_result = await process_with_deepseek(contents, file.content_type, file.filename)
+        # Pozovi DeepSeek Vision API za OCR
+        ocr_result = await process_with_deepseek_vision(contents, file.content_type)
         
         # Proveri da li je OCR uspešan
         if "error" in ocr_result:
-            # Vrati test podatke ako OCR ne radi
             return JSONResponse({
                 "status": "ocr_failed",
                 "message": f"OCR greška: {ocr_result['error']}",
@@ -55,11 +55,11 @@ async def upload_invoice(file: UploadFile = File(...)):
         return JSONResponse({
             "status": "success",
             "filename": file.filename,
-            "extracted_data": extracted_data
+            "extracted_data": extracted_data,
+            "ocr_raw_text": ocr_result.get("text", "")[:200] + "..."  # Samo prvi deo za debug
         })
         
     except Exception as e:
-        # Fallback na test podatke ako nešto pukne
         return JSONResponse({
             "status": "error_fallback",
             "message": f"Greška: {str(e)}",
@@ -72,51 +72,93 @@ async def upload_invoice(file: UploadFile = File(...)):
             }
         })
 
-async def process_with_deepseek(file_content: bytes, content_type: str, filename: str):
-    """Poziva DeepSeek OCR API - pojednostavljena verzija"""
+async def process_with_deepseek_vision(file_content: bytes, content_type: str):
+    """Koristi DeepSeek Vision API za OCR"""
     if not DEEPSEEK_API_KEY:
         return {"error": "API_KEY_NOT_SET"}
     
-    # Pojednostavljena verzija - šaljemo raw fajl
+    # Konvertuj u base64
+    base64_data = base64.b64encode(file_content).decode('utf-8')
+    
     headers = {
         "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json"
     }
     
-    files = {
-        'file': (filename, file_content, content_type)
-    }
+    # Kreiraj prompt specijalno za fakture
+    prompt = """
+    EXTRAHUJ SAV TEKST SA OVE SLIKE FAKTURE. Vrati samo sirovi tekst bez ikakvog formatiranja, bez komentara, bez markdown. 
+    Fokusiraj se na: broj fakture, datum, ukupan iznos, ime dobavljača.
+    
+    Tekst:
+    """
+    
+    # Napravi payload za vision model
+    if content_type.startswith('image/'):
+        payload = {
+            "model": "deepseek-chat",  # Ili "deepseek-vision" ako postoji
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": prompt
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{content_type};base64,{base64_data}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            "max_tokens": 2000,
+            "stream": False
+        }
+    else:
+        # Za PDF fajlove - koristimo samo tekst
+        return {"error": "PDF not yet supported - use images for now"}
     
     try:
         response = requests.post(
-            DEEPSEEK_OCR_URL,
+            DEEPSEEK_API_URL,
             headers=headers,
-            files=files,
+            json=payload,
             timeout=30
         )
         
         print(f"DeepSeek API Status: {response.status_code}")
         
         if response.status_code == 200:
-            return response.json()
+            data = response.json()
+            if "choices" in data and len(data["choices"]) > 0:
+                text_content = data["choices"][0]["message"]["content"]
+                return {"text": text_content}
+            else:
+                return {"error": "No text content in response"}
         else:
-            return {"error": f"API error {response.status_code}"}
+            error_detail = response.text
+            print(f"DeepSeek API Error: {response.status_code} - {error_detail}")
+            return {"error": f"API error {response.status_code}: {error_detail}"}
             
     except Exception as e:
+        print(f"DeepSeek Connection Error: {str(e)}")
         return {"error": f"Connection error: {str(e)}"}
 
 def extract_invoice_data(ocr_result):
     """Ekstrahuje podatke iz OCR rezultata"""
-    # Ako OCR ne radi, vrati test podatke
     if "error" in ocr_result:
         return {
             "invoice_number": "OCR-FAILED",
             "date": "N/A",
-            "total_amount": "N/A",
+            "total_amount": "N/A", 
             "vendor_name": "N/A",
             "raw_text": "OCR processing failed"
         }
     
-    text = extract_text_from_ocr(ocr_result)
+    text = ocr_result.get("text", "")
     
     extracted = {
         "invoice_number": find_invoice_number(text),
@@ -128,23 +170,14 @@ def extract_invoice_data(ocr_result):
     
     return extracted
 
-def extract_text_from_ocr(ocr_result):
-    """Ekstrahuje tekst iz OCR rezultata"""
-    if isinstance(ocr_result, str):
-        return ocr_result
-    elif 'text' in ocr_result:
-        return ocr_result['text']
-    elif 'results' in ocr_result and isinstance(ocr_result['results'], list):
-        return ' '.join([item.get('text', '') for item in ocr_result['results']])
-    else:
-        return str(ocr_result)
-
 def find_invoice_number(text):
     import re
     patterns = [
         r'Faktura[:\s]*([A-Z0-9-]+)',
         r'Invoice[:\s]*([A-Z0-9-]+)',
-        r'Broj[:\s]*([A-Z0-9-]+)'
+        r'Broj[:\s]*([A-Z0-9-]+)',
+        r'Br[.\s]*([A-Z0-9-]+)',
+        r'FAKTURA[\s]*([A-Z0-9-]+)'
     ]
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
@@ -154,16 +187,25 @@ def find_invoice_number(text):
 
 def find_date(text):
     import re
-    date_pattern = r'\d{1,2}[./]\d{1,2}[./]\d{2,4}'
-    match = re.search(date_pattern, text)
-    return match.group(0) if match else "Nije pronađen"
+    date_patterns = [
+        r'\d{1,2}[./]\d{1,2}[./]\d{2,4}',
+        r'\d{4}-\d{2}-\d{2}',
+        r'\d{1,2}\s+[a-zA-Z]+\s+\d{4}'
+    ]
+    for pattern in date_patterns:
+        matches = re.findall(pattern, text)
+        if matches:
+            return matches[0]  # Vrati prvi pronađeni datum
+    return "Nije pronađen"
 
 def find_total_amount(text):
     import re
     patterns = [
-        r'UKUPNO[:\s]*([0-9.,]+)',
-        r'TOTAL[:\s]*([0-9.,]+)',
-        r'Za uplatu[:\s]*([0-9.,]+)'
+        r'UKUPNO[:\s]*([0-9.,]+\s*(?:RSD|EUR|USD|€|\$)?)',
+        r'TOTAL[:\s]*([0-9.,]+\s*(?:RSD|EUR|USD|€|\$)?)',
+        r'Za uplatu[:\s]*([0-9.,]+\s*(?:RSD|EUR|USD|€|\$)?)',
+        r'Iznos[:\s]*([0-9.,]+\s*(?:RSD|EUR|USD|€|\$)?)',
+        r'SUM[A]?[:\s]*([0-9.,]+\s*(?:RSD|EUR|USD|€|\$)?)'
     ]
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
@@ -173,9 +215,12 @@ def find_total_amount(text):
 
 def find_vendor_name(text):
     lines = text.split('\n')
-    for line in lines[:5]:
+    for line in lines[:10]:  # Gledaj prvih 10 linija
         line = line.strip()
-        if line and len(line) > 3:
+        if (line and len(line) > 3 and 
+            not any(word in line.lower() for word in ['faktura', 'invoice', 'datum', 'date', 'ukupno', 'total']) and
+            not re.match(r'^\d+[./]\d+[./]\d+$', line) and  # Nije datum
+            not re.match(r'^[0-9.,]+\s*(?:RSD|EUR|USD)?$', line)):  # Nije iznos
             return line
     return "Nije pronađen"
 
@@ -188,5 +233,36 @@ async def api_status():
     return {
         "deepseek_api_key_set": bool(DEEPSEEK_API_KEY),
         "api_key_preview": DEEPSEEK_API_KEY[:8] + "..." if DEEPSEEK_API_KEY else "Not set",
+        "api_url": DEEPSEEK_API_URL,
         "status": "ready"
     }
+
+@app.get("/test-simple")
+async def test_simple_ocr():
+    """Testira DeepSeek API sa jednostavnim tekstom"""
+    if not DEEPSEEK_API_KEY:
+        return {"error": "API_KEY_NOT_SET"}
+    
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    
+    payload = {
+        "model": "deepseek-chat",
+        "messages": [
+            {"role": "user", "content": "Reci mi samo 'TEST USPESAN'"}
+        ],
+        "max_tokens": 10,
+        "stream": False
+    }
+    
+    try:
+        response = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            return {"status": "success", "response": data}
+        else:
+            return {"status": "error", "code": response.status_code, "detail": response.text}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
