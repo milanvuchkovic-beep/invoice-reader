@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="sr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Invoice Reader Prototype</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f5f5;
+        }
+        .upload-area {
+            border: 2px dashed #007bff;
+            border-radius: 10px;
+            padding: 40px;
+            text-align: center;
+            background: white;
+            margin: 20px 0;
+        }
+        button {
+            background: #007bff;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            margin: 10px;
+        }
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+        }
+        .result {
+            background: white;
+            padding: 20px;
+            margin-top: 20px;
+            border-radius: 5px;
+        }
+        .loading {
+            display: none;
+            color: #007bff;
+        }
+    </style>
+</head>
+<body>
+    <h1>📄 Invoice Reader Prototype</h1>
+    
+    <div class="upload-area">
+        <h3>Otpremite test fakturu</h3>
+        <input type="file" id="fileInput" accept="image/*,.pdf">
+        <br>
+        <button onclick="uploadFile()" id="uploadBtn">Pročitaj fakturu</button>
+        <div id="loading" class="loading">Obrada u toku...</div>
+    </div>
+    
+    <div id="result" class="result" style="display: none;">
+        <h3>Rezultat:</h3>
+        <div id="resultData"></div>
+    </div>
+
+    <script>
+        async function uploadFile() {
+            const fileInput = document.getElementById('fileInput');
+            const resultDiv = document.getElementById('result');
+            const resultData = document.getElementById('resultData');
+            const loading = document.getElementById('loading');
+            const uploadBtn = document.getElementById('uploadBtn');
+            
+            if (!fileInput.files[0]) {
+                alert('Izaberite fajl prvo!');
+                return;
+            }
+            
+            loading.style.display = 'block';
+            uploadBtn.disabled = true;
+            
+            try {
+                const formData = new FormData();
+                formData.append('file', fileInput.files[0]);
+                
+                const response = await fetch('http://localhost:8000/upload-invoice', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                resultData.innerHTML = `
+                    <p><strong>Status:</strong> ${data.status}</p>
+                    <p><strong>Fajl:</strong> ${data.filename}</p>
+                    <p><strong>Poruka:</strong> ${data.message}</p>
+                    <h4>Test podaci:</h4>
+                    <ul>
+                        <li>Broj fakture: ${data.extracted_data.invoice_number}</li>
+                        <li>Datum: ${data.extracted_data.date}</li>
+                        <li>Iznos: ${data.extracted_data.total_amount}</li>
+                        <li>Dobavljač: ${data.extracted_data.vendor_name}</li>
+                    </ul>
+                `;
+                
+                resultDiv.style.display = 'block';
+                
+            } catch (error) {
+                alert('Greška: ' + error.message);
+            } finally {
+                loading.style.display = 'none';
+                uploadBtn.disabled = false;
+            }
+        }
+    </script>
+</body>
+</html>
